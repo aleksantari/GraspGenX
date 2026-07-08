@@ -1,7 +1,7 @@
 # Frozen snapshot of the known-good 'graspgenx' conda env (Python 3.11, RTX 5090,
 # driver 580.x, CUDA 12.8). torch/torchvision are cu128 builds — install them with:
 #   pip install -r requirements-server.txt --extra-index-url https://download.pytorch.org/whl/cu128
-# Preferred setup is the recipe in README_SERVER.md; this file is the exact-versions backstop.
+# Preferred setup is the recipe in README.md; this file is the exact-versions backstop.
 absl-py==2.4.0
 addict==2.4.0
 aiohappyeyeballs==2.6.2
