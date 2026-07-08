@@ -8,14 +8,25 @@ natively):
 
 * ``{"action": "health"}`` → ``{"status": "ok"}``
 * ``{"action": "metadata"}`` →
-  ``{"default_gripper": str|None, "loaded_grippers": [str], "model": {...}}``
+  ``{"protocol_version": 2, "default_gripper": str|None,
+     "loaded_grippers": [str], "planner_default": str, "planners": [str],
+     "model": {...}}``
 * ``{"action": "infer", "point_cloud": (N,3) float32,
        "gripper_name": str (optional, falls back to default),
+       "planner": "diffusion"|"graspmoe"|"topdown" = "graspmoe",
+       "obb_density": "sparse"|"dense"|"dense-topandside" = "dense",
+       "skip_obb_rule": "auto"|"never" = "auto",
        "num_grasps": int = 200,
        "grasp_threshold": float = -1.0,
        "topk_num_grasps": int = 100}`` →
   ``{"grasps": (K,4,4) float32, "confidences": (K,) float32,
-     "gripper_name": str, "timing": {"infer_ms": float}}``
+     "branch_tags": ["diff"|"obb", ...], "gripper_name": str,
+     "planner": str, "timing": {"infer_ms": float}}``
+
+``planner``: ``diffusion`` = diffusion+discriminator only; ``graspmoe`` = diffusion
+union OBB-swept top-down candidates (all discriminator-scored); ``topdown`` =
+GraspMoE but OBB-only (the top-down/side candidates, diffusion dropped). Grasps are
+returned in the SAME frame as the input ``point_cloud`` and ranked by confidence.
 
 Any unhandled error is returned as ``{"error": str(exc)}`` — the client raises.
 """
@@ -34,6 +45,7 @@ import numpy as np
 import zmq
 
 from graspgenx.grasp_server import GraspGenXSampler
+from graspgenx.samplers import run_planner_on_object
 from graspgenx.utils.checkpoint_io import load_model_cfg
 from graspgenx.utils.logging_config import get_logger
 
@@ -116,12 +128,20 @@ class GraspGenXZMQServer:
                 self._samplers[gripper_name] = sampler
             return sampler
 
+    # Planner modes accepted by `infer` (see graspgenx.samplers.run_planner_on_object).
+    # "topdown" = GraspMoE with only the OBB (top-down/side) branch kept.
+    _PLANNERS = ("diffusion", "graspmoe", "topdown")
+    PROTOCOL_VERSION = 2
+
     def _handle_metadata(self) -> dict:
         diff = self.cfg.diffusion
         dis = self.cfg.discriminator
         return {
+            "protocol_version": self.PROTOCOL_VERSION,
             "default_gripper": self.default_gripper,
             "loaded_grippers": sorted(self._samplers.keys()),
+            "planner_default": "graspmoe",
+            "planners": list(self._PLANNERS),
             "model": {
                 "generator_backbone": str(diff.object_backbone),
                 "discriminator_backbone": str(dis.object_backbone),
@@ -144,37 +164,65 @@ class GraspGenXZMQServer:
         if pc.ndim != 2 or pc.shape[1] != 3:
             raise ValueError(f"point_cloud must be (N, 3); got {pc.shape}")
 
+        planner = str(request.get("planner", "graspmoe"))
+        if planner not in self._PLANNERS:
+            raise ValueError(
+                f"Unknown planner {planner!r}; expected one of {self._PLANNERS}."
+            )
+        obb_density = str(request.get("obb_density", "dense"))
+        skip_obb_rule = str(request.get("skip_obb_rule", "auto"))
         num_grasps = int(request.get("num_grasps", 200))
         grasp_threshold = float(request.get("grasp_threshold", -1.0))
         topk_num_grasps = int(request.get("topk_num_grasps", 100))
 
+        # "topdown" = GraspMoE with only the OBB (top-down/side) branch kept. We run
+        # the planner with topk disabled so the top-k cap is applied AFTER the OBB
+        # filter (otherwise the global top-k could spend its budget on diffusion grasps
+        # we're about to discard).
+        planner_internal = "graspmoe" if planner == "topdown" else planner
+        obb_only = planner == "topdown"
+        planner_topk = -1 if obb_only else topk_num_grasps
+
         sampler = self._get_sampler(gripper_name)
 
         t0 = time.monotonic()
-        grasps, confidences = GraspGenXSampler.run_inference(
+        grasps, conf, tags, _obb = run_planner_on_object(
             pc,
             sampler,
+            planner=planner_internal,
             grasp_threshold=grasp_threshold,
             num_grasps=num_grasps,
-            topk_num_grasps=topk_num_grasps,
+            topk_num_grasps=planner_topk,
+            moe_obb_density=obb_density,
+            moe_skip_obb_rule=skip_obb_rule,
         )
         infer_ms = (time.monotonic() - t0) * 1000.0
 
-        grasps_np = (
-            grasps.detach().cpu().numpy().astype(np.float32)
-            if len(grasps)
-            else np.zeros((0, 4, 4), dtype=np.float32)
-        )
-        conf_np = (
-            confidences.detach().cpu().numpy().astype(np.float32)
-            if len(confidences)
-            else np.zeros((0,), dtype=np.float32)
-        )
+        grasps = np.asarray(grasps, dtype=np.float32).reshape(-1, 4, 4)
+        conf = np.asarray(conf, dtype=np.float32).reshape(-1)
+        tags = list(tags)
+
+        if obb_only and len(tags):
+            keep = np.array([t == "obb" for t in tags], dtype=bool)
+            grasps, conf = grasps[keep], conf[keep]
+            tags = [t for t, k in zip(tags, keep) if k]
+
+        # Rank the union by confidence (descending), keeping tags aligned, then cap.
+        if len(conf):
+            order = np.argsort(-conf)
+            grasps, conf = grasps[order], conf[order]
+            tags = [tags[i] for i in order]
+            if topk_num_grasps and topk_num_grasps > 0:
+                grasps = grasps[:topk_num_grasps]
+                conf = conf[:topk_num_grasps]
+                tags = tags[:topk_num_grasps]
 
         return {
-            "grasps": grasps_np,
-            "confidences": conf_np,
+            "grasps": grasps if len(grasps) else np.zeros((0, 4, 4), dtype=np.float32),
+            "confidences": conf if len(conf) else np.zeros((0,), dtype=np.float32),
+            "branch_tags": tags,
             "gripper_name": gripper_name,
+            "planner": planner,
             "timing": {"infer_ms": float(infer_ms)},
         }
 

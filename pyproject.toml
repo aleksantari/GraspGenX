@@ -28,13 +28,14 @@ dependencies = [
     # Core PyTorch dependencies. Floor pin only — we verified the codebase
     # runs on torch 2.7 (NGC pytorch:25.03 base) as well as 2.1.0, so we
     # don't lock to a single version. Python 3.12 support requires torch
-    # >=2.2 (no cp312 wheel for 2.1.0). Cap at <2.7 because torch >=2.7
-    # only ships cu126/cu128/cu130 wheels — none are forward-compatible
-    # with the local 560.x driver. Combined with the cu124 index pin under
-    # [tool.uv.sources], this gives us a build that works on both this
-    # workstation and on the cluster.
-    "torch>=2.1,<2.7",
-    "torchvision>=0.16,<0.22",
+    # >=2.2 (no cp312 wheel for 2.1.0). The upper cap is kept loose: on a
+    # 580.x driver the cu128 wheels (torch 2.7.x) run fine — this matches
+    # the known-good local unitree-lerobot-groot env (torch 2.7.1+cu128).
+    # Combined with `torch-backend = "auto"` under [tool.uv], uv detects the
+    # local driver and picks a matching CUDA wheel, giving a build that works
+    # on both this workstation and on the cluster.
+    "torch>=2.1,<2.8",
+    "torchvision>=0.16,<0.23",
 
     # PyTorch Geometric (pure-Python meta package). The CUDA companion
     # wheels (torch-scatter / torch-cluster) are no longer dependencies.
